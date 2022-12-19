@@ -4,6 +4,9 @@ import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
 from std_msgs.msg import String
+from std_msgs.msg import Int32
+from asl_turtlebot.msg import DetectedObject
+from visualization_msgs.msg import Marker
 import tf
 import numpy as np
 from numpy import linalg
@@ -14,6 +17,7 @@ import scipy.interpolate
 import matplotlib.pyplot as plt
 from controllers import PoseController, TrajectoryTracker, HeadingController
 from enum import Enum
+import random
 
 from dynamic_reconfigure.server import Server
 from asl_turtlebot.cfg import NavigatorConfig
@@ -24,6 +28,9 @@ class Mode(Enum):
     ALIGN = 1
     TRACK = 2
     PARK = 3
+    TELEOP = 4
+    PICKUP = 5
+    STOP = 6
 
 
 class Navigator:
@@ -36,15 +43,23 @@ class Navigator:
         rospy.init_node("turtlebot_navigator", anonymous=True)
         self.mode = Mode.IDLE
 
+        # initial state
+        self.x_start = None
+        self.y_start = None
+        self.theta_start = None
+
         # current state
         self.x = 0.0
         self.y = 0.0
         self.theta = 0.0
 
+        # detected animals
+        self.detected_animals = {}
+
         # goal state
-        self.x_g = None
-        self.y_g = None
-        self.theta_g = None
+        self.x_g = 3.4
+        self.y_g = 0.4
+        self.theta_g = 3.14
 
         self.th_init = 0.0
 
@@ -59,7 +74,7 @@ class Navigator:
 
         # plan parameters
         self.plan_resolution = 0.1
-        self.plan_horizon = 15
+        self.plan_horizon = 4
 
         # time when we started following the plan
         self.current_plan_start_time = rospy.get_rostime()
@@ -67,10 +82,10 @@ class Navigator:
         self.plan_start = [0.0, 0.0]
 
         # Robot limits
-        self.v_max = 0.2  # maximum velocity
-        self.om_max = 0.4  # maximum angular velocity
+        self.v_max = 0.3  # maximum velocity
+        self.om_max = 1  # maximum angular velocity
 
-        self.v_des = 0.12  # desired cruising velocity
+        self.v_des = 0.2  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -78,22 +93,39 @@ class Navigator:
 
         # threshold at which navigator switches from trajectory to pose control
         self.near_thresh = 0.2
-        self.at_thresh = 0.02
-        self.at_thresh_theta = 0.05
+        self.at_thresh = 0.05
+        self.at_thresh_theta = 0.2
 
         # trajectory smoothing
-        self.spline_alpha = 0.15
+        self.spline_alpha = 0
         self.spline_deg = 3  # cubic spline
         self.traj_dt = 0.1
 
         # trajectory tracking controller parameters
-        self.kpx = 0.5
-        self.kpy = 0.5
-        self.kdx = 1.5
-        self.kdy = 1.5
+        self.kpx = 5
+        self.kpy = 5
+        self.kdx = 5
+        self.kdy = 5
+
+        # rescue parameters
+        self.min_pickup_time = 3 #sec
+        self.pickup_start = None
+        self.rescue_phase = False
+        self.num_rescue_targets = 0 
+        self.rescue_targets = {} # animals to rescue (key = animal, value = position)
+        self.rescue_target = None # current animal to rescue
+
+        # stop sign params
+        self.stop_sign_start = None
+        self.stop_time = 5
+        self.last_stop_sign = rospy.get_rostime()
+
+        # teleop parameters
+        self.V_teleop = 0.0
+        self.om_teleop = 0.0
 
         # heading controller parameters
-        self.kp_th = 2.0
+        self.kp_th = 1.0
 
         self.traj_controller = TrajectoryTracker(
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
@@ -114,6 +146,12 @@ class Navigator:
         )
         self.nav_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
 
+        self.animal_noise_pub = rospy.Publisher('/animal_noise', String, queue_size=10)
+
+        self.marker_pub = rospy.Publisher('/marker_topic', Marker, queue_size=10)
+
+        self.arrived_pub = rospy.Publisher('/arrived', String, queue_size=10)
+
         self.trans_listener = tf.TransformListener()
 
         self.cfg_srv = Server(NavigatorConfig, self.dyn_cfg_callback)
@@ -121,7 +159,29 @@ class Navigator:
         rospy.Subscriber("/map", OccupancyGrid, self.map_callback)
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
+        rospy.Subscriber("/cmd_vel_teleop", Twist, self.cmd_vel_teleop_callback)
+        rospy.Subscriber("/animal_unique", String, self.animal_rescue_callback)
+        rospy.Subscriber('/detector/stop_sign', DetectedObject, self.stop_sign_callback)
+        rospy.Subscriber('/num_rescues', Int32, self.num_rescues_callback)
 
+        # Detector subscribers
+        #rospy.Subscriber("/detector/bird", DetectedObject, self.bird_callback)
+        rospy.Subscriber("/detector/cat", DetectedObject, self.cat_callback)
+        rospy.Subscriber("/detector/dog", DetectedObject, self.dog_callback)
+        #rospy.Subscriber("/detector/horse", DetectedObject, self.horse_callback)
+        #rospy.Subscriber("/detector/sheep", DetectedObject, self.sheep_callback)
+        rospy.Subscriber("/detector/cow", DetectedObject, self.cow_callback)
+        rospy.Subscriber("/detector/elephant", DetectedObject, self.elephant_callback)
+        #rospy.Subscriber("/detector/bear", DetectedObject, self.bear_callback)
+        rospy.Subscriber("/detector/zebra", DetectedObject, self.zebra_callback)
+        rospy.Subscriber("/detector/giraffe", DetectedObject, self.giraffe_callback)
+
+        msg = String()
+        msg.data = "arrived"
+        self.arrived_pub.publish(msg)
+
+        rospy.sleep(10)
+        self.replan()
         print("finished init")
 
     def dyn_cfg_callback(self, config, level):
@@ -137,6 +197,7 @@ class Navigator:
         """
         loads in goal if different from current goal, and replans
         """
+        rospy.loginfo("New goal received")
         if (
             data.x != self.x_g
             or data.y != self.y_g
@@ -147,6 +208,35 @@ class Navigator:
             self.y_g = data.y
             self.theta_g = data.theta
             self.replan()
+
+
+    def cmd_vel_teleop_callback(self, data):
+        self.V_teleop = data.linear.x
+        self.om_teleop = data.angular.z
+        self.mode = Mode.TELEOP
+
+
+    def num_rescues_callback(self, msg):
+        self.num_rescue_targets = msg.data
+
+    def animal_rescue_callback(self, msg): # msg.data contains animal name (string)
+        """
+        populates rescue_targets dictionary with animals published from command line
+        """
+        if not self.rescue_phase: 
+            animal_location = self.detected_animals[msg.data]
+            self.rescue_targets[msg.data] = (animal_location['x'], animal_location['y'], animal_location['th'])
+            rospy.loginfo("ADDING %s to RESCUE TARGETS", msg.data)
+            rospy.loginfo("Number of rescue targets: %s", self.num_rescue_targets)
+            rospy.loginfo("Length of rescue_targets: %s", len(self.rescue_targets))
+            if len(self.rescue_targets) == self.num_rescue_targets:
+                self.init_rescue()
+
+
+    def stop_sign_callback(self, msg):
+        if rospy.get_rostime() - self.last_stop_sign > rospy.Duration.from_sec(60):
+            self.init_stop_sign()
+
 
     def map_md_callback(self, msg):
         """
@@ -191,6 +281,78 @@ class Navigator:
         cmd_vel.angular.z = 0.0
         self.nav_vel_pub.publish(cmd_vel)
 
+    def detected_animal(self, animal, object_msg, marker_id):
+        if not self.rescue_phase:
+            if self.occupancy.is_free((self.x, self.y)):
+                if animal not in self.detected_animals or self.detected_animals[animal]['conf'] < object_msg.confidence:
+                    self.detected_animals[animal] = {'x': self.x, 'y': self.y, 'th': self.theta, 'conf': object_msg.confidence}
+                    rospy.loginfo("Detected a %s. Currently detected animals: %s", animal, self.detected_animals.keys()) 
+                    self.publish_marker(marker_id)
+
+    def publish_marker(self, marker_id):
+        marker = Marker()
+        marker.header.frame_id = "base_footprint"
+        #marker.frame_locked = False
+        marker.header.stamp = rospy.Time()
+        marker.id = marker_id
+        rospy.loginfo("MARKER_ID: %d", marker.id)
+        marker.type = 2 # sphere
+        marker.pose.position.x = 0
+        marker.pose.position.y = 0
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 0.0
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+        marker.color.a = 1.0
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        self.marker_pub.publish(marker)
+        rospy.loginfo('Published marker!')
+
+    def bird_callback(self, object_msg):
+       self.detected_animal('bird', object_msg)
+
+    def cat_callback(self, object_msg):
+        self.detected_animal('cat', object_msg, 0)
+        # publish meow
+        meow_msg = String()
+        meow_msg.data = "MEOW"
+        self.animal_noise_pub.publish(meow_msg)
+
+    def dog_callback(self, object_msg):
+        self.detected_animal('dog', object_msg, 1)
+        # publish woof
+        woof_msg = String()
+        woof_msg.data = "WOOF"
+        self.animal_noise_pub.publish(woof_msg)
+
+    def horse_callback(self, object_msg):
+        self.detected_animal('horse', object_msg)
+
+    def sheep_callback(self, object_msg):
+        self.detected_animal('sheep', object_msg)
+
+    def cow_callback(self, object_msg):
+        self.detected_animal('cow', object_msg, 2)
+
+    def elephant_callback(self, object_msg):
+        self.detected_animal('elephant', object_msg, 3)
+
+    def bear_callback(self, object_msg):
+        self.detected_animal('bear', object_msg)
+
+    def zebra_callback(self, object_msg):
+        self.detected_animal('zebra', object_msg, 4)
+
+    def giraffe_callback(self, object_msg):
+        self.detected_animal('giraffe', object_msg, 5)
+
+
     def near_goal(self):
         """
         returns whether the robot is close enough in position to the goal to
@@ -232,6 +394,103 @@ class Navigator:
             self.plan_resolution * round(x[0] / self.plan_resolution),
             self.plan_resolution * round(x[1] / self.plan_resolution),
         )
+
+    def init_rescue(self):
+        self.rescue_phase = True
+        rospy.loginfo("RESCUE PHASE")
+        self.TSP()
+        rospy.loginfo("Rescue targets sorted: %s", self.rescue_targets)
+        self.rescue_target = self.sorted_rescue_targets[0]
+        #self.rescue_target = random.choice(list(self.rescue_targets.keys())) # choose first rescue target randomly
+        rospy.loginfo("NEXT RESCUE TARGET: %s", self.rescue_target)
+        self.x_g, self.y_g, self.theta_g = self.rescue_targets[self.rescue_target]
+        self.replan()
+
+    def init_stop_sign(self):
+        self.stop_sign_start = rospy.get_rostime()
+        self.last_stop_sign = rospy.get_rostime()
+        self.switch_mode(Mode.STOP)
+
+    def has_stopped(self):
+        """ checks if robot stops at stop sign for 3 sec """
+
+        return rospy.get_rostime() - self.stop_sign_start > rospy.Duration.from_sec(self.stop_time)
+
+    def TSP(self):
+        rospy.loginfo("Running TSP")
+
+        coordinates = {0: (self.x_start, self.y_start, self.theta_start)}
+        num_to_animal = {}
+        num = 1
+        for key, value in self.rescue_targets.items():
+            num_to_animal[num] = key
+            coordinates[num] = (value[0], value[1], value[2])
+            num += 1
+
+        rospy.loginfo("Coordinates: %s", coordinates)
+        rospy.loginfo("Num to animal: %s", num_to_animal)
+
+
+        if len(self.rescue_targets) == 1 or len(self.rescue_targets) == 2:
+            sorted_rescue_targets = list(self.rescue_targets.keys())
+            self.sorted_rescue_targets = sorted_rescue_targets
+            return
+        elif len(self.rescue_targets) == 3:
+            combinations = [[0,1,2,3,0], [0,1,3,2,0], [0,2,1,3,0]]
+        elif len(self.rescue_targets) == 4:
+            combinations = [[0,1,2,3,4,0],
+                            [0,1,2,4,3,0],
+                            [0,1,3,2,4,0],
+                            [0,1,3,4,2,0],
+                            [0,1,4,2,3,0],
+                            [0,1,4,3,2,0],
+                            [0,2,1,3,4,0],
+                            [0,2,1,4,3,0],
+                            [0,2,3,1,4,0],
+                            [0,2,4,1,3,0],
+                            [0,3,1,2,4,0]]
+
+        min_length = np.inf
+        min_combination = combinations[0]
+        for combination in combinations:
+            length_planned_path = 0
+            for i in range(len(combination)-1):
+                x_init = self.snap_to_grid((coordinates[combination[i]][0], coordinates[combination[i]][1]))
+                x_goal = self.snap_to_grid((coordinates[combination[i+1]][0], coordinates[combination[i+1]][1]))
+                problem = AStar(self.snap_to_grid((0, 0)), self.snap_to_grid((self.plan_horizon, self.plan_horizon)), x_init, x_goal, self.occupancy, self.plan_resolution)
+
+                success = problem.solve()
+                if not success:
+                    rospy.loginfo("A* failed in TSP")
+                    length_planned_path += np.inf
+                else:
+                    rospy.loginfo("A* succeded in TSP")
+                    planned_path = problem.path
+                    length_planned_path += len(planned_path)
+
+            rospy.loginfo("Length of path: %s", length_planned_path)
+            if length_planned_path < min_length:
+                min_length = length_planned_path
+                min_combination = combination
+
+        rospy.loginfo("Shortest combination: %s", min_combination)
+
+
+        sorted_rescue_targets = []
+        for j in range(1,len(min_combination)-1):
+            animal_num = min_combination[j]
+            sorted_rescue_targets.append(num_to_animal[animal_num])
+
+        self.sorted_rescue_targets = sorted_rescue_targets
+
+
+    def has_picked_up(self):
+        """ checks if animal has been picked up (robot has stopped for 3-5s) """
+        if self.mode == Mode.PICKUP and rospy.get_rostime() - self.pickup_start >= rospy.Duration.from_sec(self.min_pickup_time):
+            rospy.loginfo("STOPPED > 3 SEC")
+            return True
+        else:
+            return False
 
     def switch_mode(self, new_mode):
         rospy.loginfo("Switching from %s -> %s", self.mode, new_mode)
@@ -282,6 +541,9 @@ class Navigator:
             V, om = self.heading_controller.compute_control(
                 self.x, self.y, self.theta, t
             )
+        elif self.mode == Mode.TELEOP:
+            V = self.V_teleop
+            om = self.om_teleop 
         else:
             V = 0.0
             om = 0.0
@@ -315,7 +577,7 @@ class Navigator:
             return
 
         # Attempt to plan a path
-        state_min = self.snap_to_grid((-self.plan_horizon, -self.plan_horizon))
+        state_min = self.snap_to_grid((0, 0))
         state_max = self.snap_to_grid((self.plan_horizon, self.plan_horizon))
         x_init = self.snap_to_grid((self.x, self.y))
         self.plan_start = x_init
@@ -333,7 +595,9 @@ class Navigator:
         success = problem.solve()
         if not success:
             rospy.loginfo("Planning failed")
+            #problem.plot_tree()
             return
+
         rospy.loginfo("Planning Succeeded")
 
         planned_path = problem.path
@@ -400,9 +664,13 @@ class Navigator:
                 (translation, rotation) = self.trans_listener.lookupTransform(
                     "/map", "/base_footprint", rospy.Time(0)
                 )
+                euler = tf.transformations.euler_from_quaternion(rotation)
+                if self.x_start is None:
+                    self.x_start = translation[0]
+                    self.y_start = translation[1]
+                    self.theta_start = euler[2]
                 self.x = translation[0]
                 self.y = translation[1]
-                euler = tf.transformations.euler_from_quaternion(rotation)
                 self.theta = euler[2]
             except (
                 tf.LookupException,
@@ -411,7 +679,8 @@ class Navigator:
             ) as e:
                 self.current_plan = []
                 rospy.loginfo("Navigator: waiting for state info")
-                self.switch_mode(Mode.IDLE)
+                if self.mode != Mode.TELEOP:
+                    self.switch_mode(Mode.IDLE)
                 print(e)
                 pass
 
@@ -440,7 +709,40 @@ class Navigator:
                     self.x_g = None
                     self.y_g = None
                     self.theta_g = None
-                    self.switch_mode(Mode.IDLE)
+                    if not self.rescue_phase:
+                        msg = String()
+                        msg.data = "arrived"
+                        self.arrived_pub.publish(msg)
+                    if self.rescue_phase:
+                        rospy.loginfo("STARTING PICKUP")
+                        self.pickup_start = rospy.get_rostime()
+                        self.switch_mode(Mode.PICKUP)
+                    else:
+                        # forget about goal:
+                        self.switch_mode(Mode.IDLE)
+            elif self.mode == Mode.PICKUP:
+                # pick up animal
+                #if not self.at_goal():
+                    #self.replan()
+                    #rospy.loginfo("Stuck trying to find path")
+                if self.has_picked_up(): # robot has stopped for 3-5 sec
+                    rospy.loginfo("PICKUP COMPLETE")
+                    self.sorted_rescue_targets.remove(self.rescue_target)
+                    if self.sorted_rescue_targets: # still more animals to rescue
+                        self.rescue_target = self.sorted_rescue_targets[0]
+                        rospy.loginfo("NEXT PICKUP TARGET: %s", self.rescue_target)
+                        self.x_g, self.y_g, self.theta_g = self.rescue_targets[self.rescue_target]
+                    else:
+                        # return to start
+                        rospy.loginfo("DONE RESCUING")
+                        self.x_g = self.x_start
+                        self.y_g = self.y_start
+                        self.theta_g = self.theta_start
+                    self.replan()
+            elif self.mode == Mode.STOP:
+                # stop at stop sign
+                if self.has_stopped():
+                    self.replan()
 
             self.publish_control()
             rate.sleep()

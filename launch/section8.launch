@@ -1,0 +1,7 @@
+<launch>
+
+  <param name="mode_param" value="Mode.TELEOP" />
+  
+  <include file="$(find turtlebot3_teleop)/launch/turtlebot3_teleop_key.launch" />
+  <include file="$(find asl_turtlebot)/launch/project/project.launch"/>
+</launch>

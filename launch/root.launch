@@ -49,7 +49,7 @@
 
   <!-- ################ unconditonally useful scripts ##################### -->
   <node pkg="asl_turtlebot" type="goal_commander.py" name="goal_commander" />
-
+   
   <!-- ################ conditionally launched scripts #################### -->
   <group if="$(eval len(detector) > 0)">
     <node pkg="asl_turtlebot" type="$(arg detector)"

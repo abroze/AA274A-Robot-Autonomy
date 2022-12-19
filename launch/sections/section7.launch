@@ -1,4 +1,5 @@
 <launch>
+  <param name="mode_param" value="Mode.TELEOP" />
   <arg name="sim" default="true"/>
 
   <include file="$(find asl_turtlebot)/launch/root.launch">

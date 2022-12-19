@@ -40,7 +40,7 @@ class SupervisorParams:
         self.stop_time = rospy.get_param("~stop_time", 2.)
 
         # Minimum distance from a stop sign to obey it
-        self.stop_min_dist = rospy.get_param("~stop_min_dist", 0.5) # was formerly 0.3m
+        self.stop_min_dist = rospy.get_param("~stop_min_dist", 0.5)
 
         # Time taken to cross an intersection
         self.crossing_time = rospy.get_param("~crossing_time", 3.)
@@ -154,6 +154,11 @@ class Supervisor:
         if dist > 0 and dist < self.params.stop_min_dist and self.mode == Mode.NAV:
             self.init_stop_sign()
 
+        # if close enough and in pose mode, stop
+        if dist > 0 and dist < self.params.stop_min_dist and self.mode == Mode.POSE:
+            self.init_stop_sign()
+
+
 
     ########## STATE MACHINE ACTIONS ##########
 
@@ -253,17 +258,19 @@ class Supervisor:
         elif self.mode == Mode.POSE:
             # Moving towards a desired pose
             if self.close_to(self.x_g, self.y_g, self.theta_g):
-                self.mode = Mode.IDLE
+                self.mode = Mode.IDLE 
             else:
                 self.go_to_pose()
 
         elif self.mode == Mode.STOP:
             # At a stop sign
-            self.nav_to_pose()
+            if self.has_stopped():
+                self.init_crossing()
 
         elif self.mode == Mode.CROSS:
             # Crossing an intersection
-            self.nav_to_pose()
+            if self.has_crossed():
+                self.mode = Mode.POSE
 
         elif self.mode == Mode.NAV:
             if self.close_to(self.x_g, self.y_g, self.theta_g):

@@ -1,0 +1,14 @@
+material animal_box/cat
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      texture_unit
+      {
+        texture cat_copy.png
+      }
+    }
+  }
+}
